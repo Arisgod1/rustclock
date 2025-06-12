@@ -1,0 +1,8 @@
+[package]
+name = "clock"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+eframe = "0.31.1"        # egui 的官方框架，用于运行窗口
+chrono = "0.4"         # 用于时间处理

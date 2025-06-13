@@ -1,19 +1,6 @@
 [
   {
-    "id": 2,
-    "input": "5",
-    "duration": {
-      "secs": 5,
-      "nanos": 0
-    },
-    "paused": false,
-    "elapsed_before_pause": {
-      "secs": 0,
-      "nanos": 0
-    }
-  },
-  {
-    "id": 3,
+    "id": 5,
     "input": "5",
     "duration": {
       "secs": 5,

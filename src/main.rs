@@ -265,43 +265,49 @@ impl App for ClockApp {
                         }
 
                         ui.group(|ui| {
-                            ui.horizontal(|ui| {
+                            ui.vertical(|ui| {
                                 ui.label(format!("任务#{}，设定时间: {}", task.id, task.input));
-                                let remain = task.remaining();
-                                ui.label(format!(
-                                    "剩余 {:02}:{:02}:{:02}",
-                                    remain.as_secs() / 3600,
-                                    (remain.as_secs() / 60) % 60,
-                                    remain.as_secs() % 60
-                                ));
-                                let progress = 1.0 - remain.as_secs_f32() / task.duration.as_secs_f32();
-                                ui.add(ProgressBar::new(progress).show_percentage());
-
-                                if task.is_finished() {
-                                    if ui.button("删除").clicked() {
-                                        remove_ids.push(task.id);
-                                    }
-                                } else {
-                                    if task.paused {
-                                        if ui.button("继续").clicked() {
-                                            if let Some(pause_start) = task.pause_start {
-                                                let paused_dur = pause_start.elapsed();
-                                                task.elapsed_before_pause += paused_dur;
-                                                task.paused = false;
-                                                task.pause_start = None;
-                                            }
+                                
+                                ui.horizontal(|ui| {
+                                    let remain = task.remaining();
+                                    ui.label(format!(
+                                        "剩余 {:02}:{:02}:{:02}",
+                                        remain.as_secs() / 3600,
+                                        (remain.as_secs() / 60) % 60,
+                                        remain.as_secs() % 60
+                                    ));
+                                    let progress = 1.0 - remain.as_secs_f32() / task.duration.as_secs_f32();
+                                    ui.add(ProgressBar::new(progress).show_percentage());
+                                });
+                            
+                                ui.horizontal(|ui| {
+                                    if task.is_finished() {
+                                        if ui.button("删除").clicked() {
+                                            remove_ids.push(task.id);
                                         }
-                                    } else if ui.button("暂停").clicked() {
-                                        task.paused = true;
-                                        task.pause_start = Some(Instant::now());
+                                    } else {
+                                        if task.paused {
+                                            if ui.button("继续").clicked() {
+                                                if let Some(pause_start) = task.pause_start {
+                                                    let paused_dur = pause_start.elapsed();
+                                                    task.elapsed_before_pause += paused_dur;
+                                                    task.paused = false;
+                                                    task.pause_start = None;
+                                                }
+                                            }
+                                        } else if ui.button("暂停").clicked() {
+                                            task.paused = true;
+                                            task.pause_start = Some(Instant::now());
+                                        }
+                                    
+                                        if ui.button("停止").clicked() {
+                                            remove_ids.push(task.id);
+                                        }
                                     }
-
-                                    if ui.button("停止").clicked() {
-                                        remove_ids.push(task.id);
-                                    }
-                                }
+                                });
                             });
                         });
+
                     }
 
                     self.tasks.retain(|t| !remove_ids.contains(&t.id));

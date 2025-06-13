@@ -1,0 +1,38 @@
+{
+  "history": [
+    {
+      "id": 0,
+      "input": "2",
+      "duration": {
+        "secs": 2,
+        "nanos": 0
+      },
+      "created_at": "2025-06-13T11:29:42.845731+08:00",
+      "paused": false,
+      "elapsed_before_pause": {
+        "secs": 0,
+        "nanos": 0
+      }
+    },
+    {
+      "id": 2,
+      "input": "5",
+      "duration": {
+        "secs": 5,
+        "nanos": 0
+      },
+      "created_at": "2025-06-13T11:30:57.954511+08:00",
+      "paused": false,
+      "elapsed_before_pause": {
+        "secs": 0,
+        "nanos": 0
+      }
+    }
+  ],
+  "text_color": [
+    0,
+    0,
+    0,
+    255
+  ]
+}

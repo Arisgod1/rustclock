@@ -9,7 +9,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use egui::{Color32, Rect, TextureOptions};
+use egui::{Color32, Rect, TextureOptions, RichText};
 
 const CUSTOM_FONT_DATA: &[u8] = include_bytes!("方正小标宋简体.TTF");
 const ALARM_WAV: &[u8] = include_bytes!("alarm.wav");
@@ -20,6 +20,7 @@ struct CountdownTask {
     id: usize,
     input: String,
     duration: Duration,
+    created_at: DateTime<Local>,
     #[serde(skip)]
     start: Option<Instant>,
     paused: bool,
@@ -36,6 +37,7 @@ impl CountdownTask {
             id,
             input,
             duration,
+            created_at: Local::now(),
             start: Some(Instant::now()),
             paused: false,
             pause_start: None,
@@ -70,6 +72,12 @@ impl CountdownTask {
     }
 }
 
+#[derive(Serialize, Deserialize, Default)]
+struct PersistentData {
+    history: Vec<CountdownTask>,
+    text_color: [u8; 4], // egui::Color32 RGBA
+}
+
 struct ClockApp {
     tasks: Vec<CountdownTask>,
     next_task_id: usize,
@@ -80,10 +88,9 @@ struct ClockApp {
     background_texture: Option<egui::TextureHandle>,
     text_color: Color32,
 
-    // 音频播放相关字段，保持音频流和句柄活着
     _stream: OutputStream,
     stream_handle: OutputStreamHandle,
-    active_sinks: Vec<Sink>, // 保存正在播放的Sink
+    active_sinks: Vec<Sink>,
 }
 
 impl Default for ClockApp {
@@ -107,6 +114,39 @@ impl Default for ClockApp {
 }
 
 impl ClockApp {
+    fn data_path() -> &'static str {
+        "countdown_data.json"
+    }
+
+    fn load_data(&mut self) {
+        if Path::new(Self::data_path()).exists() {
+            if let Ok(data) = fs::read_to_string(Self::data_path()) {
+                if let Ok(persist) = serde_json::from_str::<PersistentData>(&data) {
+                    self.history = persist.history;
+                    self.text_color = Color32::from_rgba_unmultiplied(
+                        persist.text_color[0],
+                        persist.text_color[1],
+                        persist.text_color[2],
+                        persist.text_color[3],
+                    );
+                    if let Some(max_id) = self.history.iter().map(|t| t.id).max() {
+                        self.next_task_id = max_id + 1;
+                    }
+                }
+            }
+        }
+    }
+
+    fn save_data(&self) {
+        let persist = PersistentData {
+            history: self.history.clone(),
+            text_color: self.text_color.to_array(),
+        };
+        if let Ok(json) = serde_json::to_string_pretty(&persist) {
+            let _ = fs::write(Self::data_path(), json);
+        }
+    }
+
     fn parse_duration(input: &str) -> Option<Duration> {
         let parts: Vec<&str> = input.trim().split(':').collect();
         match parts.len() {
@@ -131,7 +171,6 @@ impl ClockApp {
             let cursor = Cursor::new(ALARM_WAV);
             if let Ok(source) = Decoder::new(cursor) {
                 sink.append(source);
-                // 不调用 detach，保持 sink 活着
                 self.active_sinks.push(sink);
             }
         }
@@ -142,30 +181,6 @@ impl ClockApp {
             .summary(summary)
             .body(body)
             .show();
-    }
-
-    fn history_path() -> &'static str {
-        "countdown_history.json"
-    }
-
-    fn load_history(&mut self) {
-        if Path::new(Self::history_path()).exists() {
-            if let Ok(data) = fs::read_to_string(Self::history_path()) {
-                if let Ok(hist) = serde_json::from_str::<Vec<CountdownTask>>(&data) {
-                    self.history = hist;
-                    // 设置 next_task_id 为最大已用 ID + 1，避免编号重复
-                    if let Some(max_id) = self.history.iter().map(|t| t.id).max() {
-                        self.next_task_id = max_id + 1;
-                    }
-                }
-            }
-        }
-    }
-
-    fn save_history(&self) {
-        if let Ok(json) = serde_json::to_string_pretty(&self.history) {
-            let _ = fs::write(Self::history_path(), json);
-        }
     }
 
     fn load_background(&mut self, ctx: &egui::Context) {
@@ -193,18 +208,14 @@ impl App for ClockApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut Frame) {
         use egui::*;
 
-        // 清理已播放完的Sink
         self.active_sinks.retain(|sink| !sink.empty());
 
-        // 设置文字颜色
         let mut style = (*ctx.style()).clone();
         style.visuals.override_text_color = Some(self.text_color);
         ctx.set_style(style);
 
-        // 加载背景纹理
         self.load_background(ctx);
 
-        // 绘制背景
         if let Some(texture) = &self.background_texture {
             let painter = ctx.layer_painter(LayerId::background());
             let rect = ctx.input(|i| i.screen_rect());
@@ -212,9 +223,13 @@ impl App for ClockApp {
         }
 
         CentralPanel::default().show(ctx, |ui| {
-            ui.heading("当前时间");
-            let now = Local::now();
-            ui.label(now.format("%H:%M:%S").to_string());
+            ui.vertical_centered(|ui| {
+                ui.add_space(10.0);
+                ui.heading(RichText::new(Local::now().format("%H:%M:%S").to_string())
+                    .size(48.0)
+                    .color(self.text_color));
+                ui.add_space(10.0);
+            });
 
             ui.separator();
 
@@ -230,13 +245,14 @@ impl App for ClockApp {
                         (color[1] * 255.0) as u8,
                         (color[2] * 255.0) as u8,
                     );
+                    self.save_data();
                 }
             });
 
             ui.separator();
 
             ui.horizontal(|ui| {
-                ui.label("新倒计时 (秒或 HH:MM:SS):");
+                ui.label("倒计时 (秒或 HH:MM:SS):");
                 ui.text_edit_singleline(&mut self.new_task_input);
                 if ui.button("添加").clicked() {
                     if let Some(dur) = Self::parse_duration(&self.new_task_input) {
@@ -266,12 +282,16 @@ impl App for ClockApp {
 
                         ui.group(|ui| {
                             ui.vertical(|ui| {
-                                ui.label(format!("任务#{}，设定时间: {}", task.id, task.input));
-                                
+                                ui.label(RichText::new(
+                                    format!("开始时间: {}", task.created_at.format("%Y-%m-%d %H:%M:%S"))
+                                ).strong());
+
+                                ui.label(format!("设定时长: {}", task.input));
+
                                 ui.horizontal(|ui| {
                                     let remain = task.remaining();
                                     ui.label(format!(
-                                        "剩余 {:02}:{:02}:{:02}",
+                                        "剩余时间: {:02}:{:02}:{:02}",
                                         remain.as_secs() / 3600,
                                         (remain.as_secs() / 60) % 60,
                                         remain.as_secs() % 60
@@ -279,7 +299,7 @@ impl App for ClockApp {
                                     let progress = 1.0 - remain.as_secs_f32() / task.duration.as_secs_f32();
                                     ui.add(ProgressBar::new(progress).show_percentage());
                                 });
-                            
+
                                 ui.horizontal(|ui| {
                                     if task.is_finished() {
                                         if ui.button("删除").clicked() {
@@ -299,7 +319,7 @@ impl App for ClockApp {
                                             task.paused = true;
                                             task.pause_start = Some(Instant::now());
                                         }
-                                    
+
                                         if ui.button("停止").clicked() {
                                             remove_ids.push(task.id);
                                         }
@@ -308,19 +328,20 @@ impl App for ClockApp {
                             });
                         });
 
+                        ui.add_space(10.0);
                     }
 
                     self.tasks.retain(|t| !remove_ids.contains(&t.id));
+
+                    for task in just_finished_tasks {
+                        self.play_alarm_sound();
+                        Self::show_notification("倒计时结束", &format!("开始于 {} 的倒计时已结束", task.created_at.format("%Y-%m-%d %H:%M:%S")));
+                        self.history.push(task.clone());
+                        self.save_data();
+                        self.show_finished_popup = Some(task.id);
+                    }
                 });
             });
-
-            for task in just_finished_tasks {
-                self.play_alarm_sound();
-                Self::show_notification("倒计时结束", &format!("任务#{} 已结束", task.id));
-                self.history.push(task.clone());
-                self.save_history();
-                self.show_finished_popup = Some(task.id);
-            }
 
             ui.separator();
 
@@ -334,15 +355,20 @@ impl App for ClockApp {
                     let mut remove_history_ids = Vec::new();
                     for task in self.history.iter().rev() {
                         ui.horizontal(|ui| {
-                            ui.label(format!("任务#{} 结束，设定时间: {}", task.id, task.input));
+                            ui.label(format!(
+                                "开始时间: {}，设定时长: {}",
+                                task.created_at.format("%Y-%m-%d %H:%M:%S"),
+                                task.input
+                            ));
                             if ui.button("删除").clicked() {
                                 remove_history_ids.push(task.id);
                             }
                         });
+                        ui.add_space(4.0);
                     }
                     if !remove_history_ids.is_empty() {
                         self.history.retain(|t| !remove_history_ids.contains(&t.id));
-                        self.save_history();
+                        self.save_data();
                     }
                 });
             });
@@ -354,7 +380,11 @@ impl App for ClockApp {
                 .resizable(false)
                 .anchor(Align2::CENTER_CENTER, [0.0, 0.0])
                 .show(ctx, |ui| {
-                    ui.label(format!("任务#{} 已结束！", id));
+                    let task_time = self.tasks.iter()
+                        .find(|t| t.id == id)
+                        .map(|t| t.created_at.format("%Y-%m-%d %H:%M:%S").to_string())
+                        .unwrap_or_else(|| "未知".to_string());
+                    ui.label(format!("开始于 {} 的倒计时已结束！", task_time));
                     if ui.button("关闭").clicked() {
                         self.show_finished_popup = None;
                     }
@@ -369,7 +399,7 @@ fn main() {
     let native_options = eframe::NativeOptions::default();
 
     eframe::run_native(
-        "Rust 多任务倒计时 (带声音提醒/通知/历史)",
+        "Rust 多任务倒计时",
         native_options,
         Box::new(|cc| {
             let mut fonts = egui::FontDefinitions::default();
@@ -390,7 +420,7 @@ fn main() {
             cc.egui_ctx.set_fonts(fonts);
 
             let mut app = ClockApp::default();
-            app.load_history();
+            app.load_data();
             Box::new(app)
         }),
     );

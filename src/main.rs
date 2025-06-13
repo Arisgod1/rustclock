@@ -1,18 +1,19 @@
 use chrono::{DateTime, Local};
 use eframe::{egui, App, Frame};
-use rodio::{Decoder, OutputStream, Sink};
+use rodio::{Decoder, OutputStream, OutputStreamHandle, Sink};
 use serde::{Deserialize, Serialize};
 use std::{
     fs,
     io::Cursor,
-    path::{Path, PathBuf},
+    path::Path,
     time::{Duration, Instant},
 };
 
-use egui::{Color32, Pos2, Rect, TextureOptions};
+use egui::{Color32, Rect, TextureOptions};
 
 const CUSTOM_FONT_DATA: &[u8] = include_bytes!("方正小标宋简体.TTF");
 const ALARM_WAV: &[u8] = include_bytes!("alarm.wav");
+const BACKGROUND_IMAGE_PATH: &str = "background.png";
 
 #[derive(Clone, Serialize, Deserialize)]
 struct CountdownTask {
@@ -69,11 +70,6 @@ impl CountdownTask {
     }
 }
 
-#[derive(Serialize, Deserialize)]
-struct Config {
-    text_color: [u8; 4], // RGBA
-}
-
 struct ClockApp {
     tasks: Vec<CountdownTask>,
     next_task_id: usize,
@@ -84,15 +80,16 @@ struct ClockApp {
     background_texture: Option<egui::TextureHandle>,
     text_color: Color32,
 
-    config_path: PathBuf,
+    // 音频播放相关字段，保持音频流和句柄活着
+    _stream: OutputStream,
+    stream_handle: OutputStreamHandle,
+    active_sinks: Vec<Sink>, // 保存正在播放的Sink
 }
 
 impl Default for ClockApp {
     fn default() -> Self {
-        // 获取程序执行目录，构造配置文件路径
-        let exe_path = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("."));
-        let exe_dir = exe_path.parent().unwrap_or_else(|| Path::new("."));
-        let config_path = exe_dir.join("config.json");
+        let (_stream, stream_handle) =
+            OutputStream::try_default().expect("Failed to initialize audio output");
 
         Self {
             tasks: Vec::new(),
@@ -101,8 +98,10 @@ impl Default for ClockApp {
             history: Vec::new(),
             show_finished_popup: None,
             background_texture: None,
-            text_color: Color32::from_rgb(220, 220, 220), // 默认浅灰色
-            config_path,
+            text_color: Color32::from_rgb(220, 220, 220),
+            _stream,
+            stream_handle,
+            active_sinks: Vec::new(),
         }
     }
 }
@@ -127,14 +126,13 @@ impl ClockApp {
         }
     }
 
-    fn play_alarm_sound() {
-        if let Ok((_stream, stream_handle)) = OutputStream::try_default() {
-            if let Ok(sink) = Sink::try_new(&stream_handle) {
-                let cursor = Cursor::new(ALARM_WAV);
-                if let Ok(source) = Decoder::new(cursor) {
-                    sink.append(source);
-                    sink.detach();
-                }
+    fn play_alarm_sound(&mut self) {
+        if let Ok(sink) = Sink::try_new(&self.stream_handle) {
+            let cursor = Cursor::new(ALARM_WAV);
+            if let Ok(source) = Decoder::new(cursor) {
+                sink.append(source);
+                // 不调用 detach，保持 sink 活着
+                self.active_sinks.push(sink);
             }
         }
     }
@@ -155,6 +153,10 @@ impl ClockApp {
             if let Ok(data) = fs::read_to_string(Self::history_path()) {
                 if let Ok(hist) = serde_json::from_str::<Vec<CountdownTask>>(&data) {
                     self.history = hist;
+                    // 设置 next_task_id 为最大已用 ID + 1，避免编号重复
+                    if let Some(max_id) = self.history.iter().map(|t| t.id).max() {
+                        self.next_task_id = max_id + 1;
+                    }
                 }
             }
         }
@@ -166,48 +168,17 @@ impl ClockApp {
         }
     }
 
-    fn load_config(&mut self) {
-        if self.config_path.exists() {
-            if let Ok(data) = fs::read_to_string(&self.config_path) {
-                if let Ok(config) = serde_json::from_str::<Config>(&data) {
-                    self.text_color = Color32::from_rgba_unmultiplied(
-                        config.text_color[0],
-                        config.text_color[1],
-                        config.text_color[2],
-                        config.text_color[3],
-                    );
-                }
-            }
-        }
-    }
-
-    fn save_config(&self) {
-        let config = Config {
-            text_color: self.text_color.to_array(),
-        };
-        if let Ok(json) = serde_json::to_string_pretty(&config) {
-            let _ = fs::write(&self.config_path, json);
-        }
-    }
-
-    fn background_image_path(&self) -> PathBuf {
-        // 程序exe目录下的background.png
-        let exe_path = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("."));
-        let exe_dir = exe_path.parent().unwrap_or_else(|| Path::new("."));
-        exe_dir.join("background.png")
-    }
-
     fn load_background(&mut self, ctx: &egui::Context) {
         if self.background_texture.is_some() {
             return;
         }
-        let path = self.background_image_path();
-        if path.exists() {
-            if let Ok(img) = image::open(path) {
+        if Path::new(BACKGROUND_IMAGE_PATH).exists() {
+            if let Ok(img) = image::open(BACKGROUND_IMAGE_PATH) {
                 let size = [img.width() as usize, img.height() as usize];
                 let img = img.to_rgba8();
                 let pixels = img.as_flat_samples();
-                let color_image = egui::ColorImage::from_rgba_unmultiplied(size, pixels.as_slice());
+                let color_image =
+                    egui::ColorImage::from_rgba_unmultiplied(size, pixels.as_slice());
                 self.background_texture = Some(ctx.load_texture(
                     "background",
                     color_image,
@@ -222,6 +193,9 @@ impl App for ClockApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut Frame) {
         use egui::*;
 
+        // 清理已播放完的Sink
+        self.active_sinks.retain(|sink| !sink.empty());
+
         // 设置文字颜色
         let mut style = (*ctx.style()).clone();
         style.visuals.override_text_color = Some(self.text_color);
@@ -233,17 +207,8 @@ impl App for ClockApp {
         // 绘制背景
         if let Some(texture) = &self.background_texture {
             let painter = ctx.layer_painter(LayerId::background());
-
             let rect = ctx.input(|i| i.screen_rect());
-            let rect_min = rect.min;
-            let rect_max = rect.max;
-
-            painter.image(
-                texture.id(),
-                rect,
-                Rect::from_min_max(rect_min, rect_max),
-                Color32::WHITE,
-            );
+            painter.image(texture.id(), rect, Rect::from_min_max(rect.min, rect.max), Color32::WHITE);
         }
 
         CentralPanel::default().show(ctx, |ui| {
@@ -265,7 +230,6 @@ impl App for ClockApp {
                         (color[1] * 255.0) as u8,
                         (color[2] * 255.0) as u8,
                     );
-                    self.save_config(); // 修改后立即保存
                 }
             });
 
@@ -345,7 +309,7 @@ impl App for ClockApp {
             });
 
             for task in just_finished_tasks {
-                Self::play_alarm_sound();
+                self.play_alarm_sound();
                 Self::show_notification("倒计时结束", &format!("任务#{} 已结束", task.id));
                 self.history.push(task.clone());
                 self.save_history();
@@ -361,8 +325,18 @@ impl App for ClockApp {
                     if self.history.is_empty() {
                         ui.label("暂无历史记录");
                     }
+                    let mut remove_history_ids = Vec::new();
                     for task in self.history.iter().rev() {
-                        ui.label(format!("任务#{} 结束，设定时间: {}", task.id, task.input));
+                        ui.horizontal(|ui| {
+                            ui.label(format!("任务#{} 结束，设定时间: {}", task.id, task.input));
+                            if ui.button("删除").clicked() {
+                                remove_history_ids.push(task.id);
+                            }
+                        });
+                    }
+                    if !remove_history_ids.is_empty() {
+                        self.history.retain(|t| !remove_history_ids.contains(&t.id));
+                        self.save_history();
                     }
                 });
             });
@@ -411,7 +385,6 @@ fn main() {
 
             let mut app = ClockApp::default();
             app.load_history();
-            app.load_config(); // 加载文字颜色配置
             Box::new(app)
         }),
     );

@@ -1,52 +1,123 @@
-use chrono::Local;
+use chrono::{DateTime, Local};
 use eframe::{egui, App, Frame};
-use std::time::{Duration, Instant};
+use rodio::{Decoder, OutputStream, Sink};
+use serde::{Deserialize, Serialize};
+use std::{
+    fs,
+    io::Cursor,
+    path::{Path, PathBuf},
+    time::{Duration, Instant},
+};
+
+use egui::{Color32, Pos2, Rect, TextureOptions};
 
 const CUSTOM_FONT_DATA: &[u8] = include_bytes!("方正小标宋简体.TTF");
+const ALARM_WAV: &[u8] = include_bytes!("alarm.wav");
+
+#[derive(Clone, Serialize, Deserialize)]
+struct CountdownTask {
+    id: usize,
+    input: String,
+    duration: Duration,
+    #[serde(skip)]
+    start: Option<Instant>,
+    paused: bool,
+    #[serde(skip)]
+    pause_start: Option<Instant>,
+    elapsed_before_pause: Duration,
+    #[serde(skip)]
+    finished_at: Option<DateTime<Local>>,
+}
+
+impl CountdownTask {
+    fn new(id: usize, input: String, duration: Duration) -> Self {
+        Self {
+            id,
+            input,
+            duration,
+            start: Some(Instant::now()),
+            paused: false,
+            pause_start: None,
+            elapsed_before_pause: Duration::ZERO,
+            finished_at: None,
+        }
+    }
+
+    fn elapsed(&self) -> Duration {
+        if let Some(start) = self.start {
+            if self.paused {
+                self.elapsed_before_pause
+            } else {
+                self.elapsed_before_pause + start.elapsed()
+            }
+        } else {
+            Duration::ZERO
+        }
+    }
+
+    fn remaining(&self) -> Duration {
+        let elapsed = self.elapsed();
+        if elapsed >= self.duration {
+            Duration::ZERO
+        } else {
+            self.duration - elapsed
+        }
+    }
+
+    fn is_finished(&self) -> bool {
+        self.elapsed() >= self.duration
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+struct Config {
+    text_color: [u8; 4], // RGBA
+}
 
 struct ClockApp {
-    countdown_input: String,
-    countdown_start: Option<Instant>,
-    countdown_duration: Option<Duration>,
-    countdown_active: bool,
-    paused: bool,
-    paused_instant: Option<Instant>,
-    history: Vec<(String, chrono::DateTime<Local>)>,
-    show_finished_popup: bool,
+    tasks: Vec<CountdownTask>,
+    next_task_id: usize,
+    new_task_input: String,
+    history: Vec<CountdownTask>,
+    show_finished_popup: Option<usize>,
+
+    background_texture: Option<egui::TextureHandle>,
+    text_color: Color32,
+
+    config_path: PathBuf,
 }
 
 impl Default for ClockApp {
     fn default() -> Self {
+        // 获取程序执行目录，构造配置文件路径
+        let exe_path = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("."));
+        let exe_dir = exe_path.parent().unwrap_or_else(|| Path::new("."));
+        let config_path = exe_dir.join("config.json");
+
         Self {
-            countdown_input: String::new(),
-            countdown_start: None,
-            countdown_duration: None,
-            countdown_active: false,
-            paused: false,
-            paused_instant: None,
+            tasks: Vec::new(),
+            next_task_id: 0,
+            new_task_input: String::new(),
             history: Vec::new(),
-            show_finished_popup: false,
+            show_finished_popup: None,
+            background_texture: None,
+            text_color: Color32::from_rgb(220, 220, 220), // 默认浅灰色
+            config_path,
         }
     }
 }
 
 impl ClockApp {
-    /// 支持秒或者 HH:MM:SS 格式的解析
     fn parse_duration(input: &str) -> Option<Duration> {
         let parts: Vec<&str> = input.trim().split(':').collect();
         match parts.len() {
-            1 => {
-                // 纯秒数
-                parts[0].parse::<u64>().ok().map(Duration::from_secs)
-            }
+            1 => parts[0].parse::<u64>().ok().map(Duration::from_secs),
             2 => {
-                // MM:SS
                 let mins = parts[0].parse::<u64>().ok()?;
                 let secs = parts[1].parse::<u64>().ok()?;
                 Some(Duration::from_secs(mins * 60 + secs))
             }
             3 => {
-                // HH:MM:SS
                 let hours = parts[0].parse::<u64>().ok()?;
                 let mins = parts[1].parse::<u64>().ok()?;
                 let secs = parts[2].parse::<u64>().ok()?;
@@ -56,155 +127,260 @@ impl ClockApp {
         }
     }
 
-    /// 获取倒计时已流逝时间，已考虑暂停时间
-    fn elapsed(&self) -> Duration {
-        if !self.countdown_active {
-            return Duration::ZERO;
-        }
-        if let Some(start) = self.countdown_start {
-            if self.paused {
-                if let Some(pause_start) = self.paused_instant {
-                    // 处于暂停状态，elapsed计到暂停开始时刻
-                    pause_start.duration_since(start)
-                } else {
-                    Duration::ZERO
+    fn play_alarm_sound() {
+        if let Ok((_stream, stream_handle)) = OutputStream::try_default() {
+            if let Ok(sink) = Sink::try_new(&stream_handle) {
+                let cursor = Cursor::new(ALARM_WAV);
+                if let Ok(source) = Decoder::new(cursor) {
+                    sink.append(source);
+                    sink.detach();
                 }
-            } else {
-                start.elapsed()
             }
-        } else {
-            Duration::ZERO
+        }
+    }
+
+    fn show_notification(summary: &str, body: &str) {
+        let _ = notify_rust::Notification::new()
+            .summary(summary)
+            .body(body)
+            .show();
+    }
+
+    fn history_path() -> &'static str {
+        "countdown_history.json"
+    }
+
+    fn load_history(&mut self) {
+        if Path::new(Self::history_path()).exists() {
+            if let Ok(data) = fs::read_to_string(Self::history_path()) {
+                if let Ok(hist) = serde_json::from_str::<Vec<CountdownTask>>(&data) {
+                    self.history = hist;
+                }
+            }
+        }
+    }
+
+    fn save_history(&self) {
+        if let Ok(json) = serde_json::to_string_pretty(&self.history) {
+            let _ = fs::write(Self::history_path(), json);
+        }
+    }
+
+    fn load_config(&mut self) {
+        if self.config_path.exists() {
+            if let Ok(data) = fs::read_to_string(&self.config_path) {
+                if let Ok(config) = serde_json::from_str::<Config>(&data) {
+                    self.text_color = Color32::from_rgba_unmultiplied(
+                        config.text_color[0],
+                        config.text_color[1],
+                        config.text_color[2],
+                        config.text_color[3],
+                    );
+                }
+            }
+        }
+    }
+
+    fn save_config(&self) {
+        let config = Config {
+            text_color: self.text_color.to_array(),
+        };
+        if let Ok(json) = serde_json::to_string_pretty(&config) {
+            let _ = fs::write(&self.config_path, json);
+        }
+    }
+
+    fn background_image_path(&self) -> PathBuf {
+        // 程序exe目录下的background.png
+        let exe_path = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("."));
+        let exe_dir = exe_path.parent().unwrap_or_else(|| Path::new("."));
+        exe_dir.join("background.png")
+    }
+
+    fn load_background(&mut self, ctx: &egui::Context) {
+        if self.background_texture.is_some() {
+            return;
+        }
+        let path = self.background_image_path();
+        if path.exists() {
+            if let Ok(img) = image::open(path) {
+                let size = [img.width() as usize, img.height() as usize];
+                let img = img.to_rgba8();
+                let pixels = img.as_flat_samples();
+                let color_image = egui::ColorImage::from_rgba_unmultiplied(size, pixels.as_slice());
+                self.background_texture = Some(ctx.load_texture(
+                    "background",
+                    color_image,
+                    TextureOptions::LINEAR,
+                ));
+            }
         }
     }
 }
 
 impl App for ClockApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut Frame) {
-        egui::CentralPanel::default().show(ctx, |ui| {
-            // 当前时间显示
-            let now = Local::now();
-            let time_string = now.format("%H:%M:%S").to_string();
+        use egui::*;
+
+        // 设置文字颜色
+        let mut style = (*ctx.style()).clone();
+        style.visuals.override_text_color = Some(self.text_color);
+        ctx.set_style(style);
+
+        // 加载背景纹理
+        self.load_background(ctx);
+
+        // 绘制背景
+        if let Some(texture) = &self.background_texture {
+            let painter = ctx.layer_painter(LayerId::background());
+
+            let rect = ctx.input(|i| i.screen_rect());
+            let rect_min = rect.min;
+            let rect_max = rect.max;
+
+            painter.image(
+                texture.id(),
+                rect,
+                Rect::from_min_max(rect_min, rect_max),
+                Color32::WHITE,
+            );
+        }
+
+        CentralPanel::default().show(ctx, |ui| {
             ui.heading("当前时间");
-            ui.label(time_string);
+            let now = Local::now();
+            ui.label(now.format("%H:%M:%S").to_string());
 
             ui.separator();
 
-            // 倒计时输入和控制
-            ui.heading("倒计时 (支持秒 或 HH:MM:SS 格式)");
-
             ui.horizontal(|ui| {
-                ui.label("时间:");
-                ui.text_edit_singleline(&mut self.countdown_input);
+                ui.label("文字颜色:");
+                let mut color = {
+                    let [r, g, b, _a] = self.text_color.to_array();
+                    [r as f32 / 255.0, g as f32 / 255.0, b as f32 / 255.0]
+                };
+                if ui.color_edit_button_rgb(&mut color).changed() {
+                    self.text_color = Color32::from_rgb(
+                        (color[0] * 255.0) as u8,
+                        (color[1] * 255.0) as u8,
+                        (color[2] * 255.0) as u8,
+                    );
+                    self.save_config(); // 修改后立即保存
+                }
             });
 
-            if !self.countdown_active {
-                if ui.button("开始倒计时").clicked() {
-                    if let Some(dur) = Self::parse_duration(&self.countdown_input) {
+            ui.separator();
+
+            ui.horizontal(|ui| {
+                ui.label("新倒计时 (秒或 HH:MM:SS):");
+                ui.text_edit_singleline(&mut self.new_task_input);
+                if ui.button("添加").clicked() {
+                    if let Some(dur) = Self::parse_duration(&self.new_task_input) {
                         if dur.as_secs() > 0 {
-                            self.countdown_start = Some(Instant::now());
-                            self.countdown_duration = Some(dur);
-                            self.countdown_active = true;
-                            self.paused = false;
-                            self.paused_instant = None;
+                            let id = self.next_task_id;
+                            self.next_task_id += 1;
+                            self.tasks.push(CountdownTask::new(id, self.new_task_input.clone(), dur));
+                            self.new_task_input.clear();
                         }
                     }
                 }
-            } else {
-                let duration = self.countdown_duration.unwrap_or_default();
-                let elapsed = self.elapsed();
+            });
 
-                if elapsed >= duration {
-                    // 结束倒计时
-                    self.countdown_active = false;
-                    self.countdown_start = None;
-                    self.countdown_duration = None;
-                    self.paused = false;
-                    self.paused_instant = None;
+            ui.separator();
 
-                    // 记录历史
-                    let input_str = self.countdown_input.clone();
-                    self.history.push((input_str, Local::now()));
-                    self.countdown_input.clear();
+            let mut just_finished_tasks = Vec::new();
 
-                    // 弹窗提醒
-                    self.show_finished_popup = true;
-                } else {
-                    let remain = duration - elapsed;
-                    let progress = 1.0 - remain.as_secs_f32() / duration.as_secs_f32();
+            ui.push_id("countdown_tasks", |ui| {
+                ScrollArea::vertical().max_height(300.0).show(ui, |ui| {
+                    let mut remove_ids = Vec::new();
 
-                    ui.label(format!(
-                        "倒计时剩余: {:02}:{:02}:{:02}",
-                        remain.as_secs() / 3600,
-                        (remain.as_secs() / 60) % 60,
-                        remain.as_secs() % 60
-                    ));
-                    ui.add(egui::ProgressBar::new(progress).show_percentage());
+                    for task in &mut self.tasks {
+                        if task.is_finished() && task.finished_at.is_none() {
+                            task.finished_at = Some(Local::now());
+                            just_finished_tasks.push(task.clone());
+                        }
 
-                    ui.horizontal(|ui| {
-                        if self.paused {
-                            if ui.button("继续").clicked() {
-                                if let Some(pause_start) = self.paused_instant {
-                                    let paused_duration = pause_start.elapsed();
-                                    if let Some(start) = self.countdown_start.as_mut() {
-                                        *start += paused_duration;
+                        ui.group(|ui| {
+                            ui.horizontal(|ui| {
+                                ui.label(format!("任务#{}，设定时间: {}", task.id, task.input));
+                                let remain = task.remaining();
+                                ui.label(format!(
+                                    "剩余 {:02}:{:02}:{:02}",
+                                    remain.as_secs() / 3600,
+                                    (remain.as_secs() / 60) % 60,
+                                    remain.as_secs() % 60
+                                ));
+                                let progress = 1.0 - remain.as_secs_f32() / task.duration.as_secs_f32();
+                                ui.add(ProgressBar::new(progress).show_percentage());
+
+                                if task.is_finished() {
+                                    if ui.button("删除").clicked() {
+                                        remove_ids.push(task.id);
                                     }
-                                    self.paused = false;
-                                    self.paused_instant = None;
-                                }
-                            }
-                        } else {
-                            if ui.button("暂停").clicked() {
-                                self.paused = true;
-                                self.paused_instant = Some(Instant::now());
-                            }
-                        }
+                                } else {
+                                    if task.paused {
+                                        if ui.button("继续").clicked() {
+                                            if let Some(pause_start) = task.pause_start {
+                                                let paused_dur = pause_start.elapsed();
+                                                task.elapsed_before_pause += paused_dur;
+                                                task.paused = false;
+                                                task.pause_start = None;
+                                            }
+                                        }
+                                    } else if ui.button("暂停").clicked() {
+                                        task.paused = true;
+                                        task.pause_start = Some(Instant::now());
+                                    }
 
-                        if ui.button("停止").clicked() {
-                            self.countdown_active = false;
-                            self.countdown_start = None;
-                            self.countdown_duration = None;
-                            self.paused = false;
-                            self.paused_instant = None;
-                            self.countdown_input.clear();
-                        }
-                    });
-                }
+                                    if ui.button("停止").clicked() {
+                                        remove_ids.push(task.id);
+                                    }
+                                }
+                            });
+                        });
+                    }
+
+                    self.tasks.retain(|t| !remove_ids.contains(&t.id));
+                });
+            });
+
+            for task in just_finished_tasks {
+                Self::play_alarm_sound();
+                Self::show_notification("倒计时结束", &format!("任务#{} 已结束", task.id));
+                self.history.push(task.clone());
+                self.save_history();
+                self.show_finished_popup = Some(task.id);
             }
 
             ui.separator();
 
-            // 历史记录显示
-            ui.heading("倒计时历史");
-            egui::ScrollArea::vertical().max_height(150.0).show(ui, |ui| {
-                if self.history.is_empty() {
-                    ui.label("暂无历史记录");
-                } else {
-                    for (dur_str, finish_time) in self.history.iter().rev() {
-                        ui.label(format!(
-                            "倒计时 {} 于 {} 结束",
-                            dur_str,
-                            finish_time.format("%Y-%m-%d %H:%M:%S")
-                        ));
+            ui.heading("历史记录");
+
+            ui.push_id("history_list", |ui| {
+                ScrollArea::vertical().max_height(150.0).show(ui, |ui| {
+                    if self.history.is_empty() {
+                        ui.label("暂无历史记录");
                     }
-                }
+                    for task in self.history.iter().rev() {
+                        ui.label(format!("任务#{} 结束，设定时间: {}", task.id, task.input));
+                    }
+                });
             });
         });
 
-        // 倒计时结束弹窗
-        if self.show_finished_popup {
-            egui::Window::new("提醒")
+        if let Some(id) = self.show_finished_popup {
+            Window::new("提醒")
                 .collapsible(false)
                 .resizable(false)
-                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                .anchor(Align2::CENTER_CENTER, [0.0, 0.0])
                 .show(ctx, |ui| {
-                    ui.label("倒计时结束！");
+                    ui.label(format!("任务#{} 已结束！", id));
                     if ui.button("关闭").clicked() {
-                        self.show_finished_popup = false;
+                        self.show_finished_popup = None;
                     }
                 });
         }
 
-        // 请求重绘，保证动画和时间更新
         ctx.request_repaint_after(Duration::from_millis(200));
     }
 }
@@ -213,16 +389,14 @@ fn main() {
     let native_options = eframe::NativeOptions::default();
 
     eframe::run_native(
-        "Rust Clock + Countdown (增强版)",
+        "Rust 多任务倒计时 (带声音提醒/通知/历史)",
         native_options,
         Box::new(|cc| {
             let mut fonts = egui::FontDefinitions::default();
-
             fonts.font_data.insert(
                 "fz_font".to_owned(),
                 egui::FontData::from_static(CUSTOM_FONT_DATA).into(),
             );
-
             fonts
                 .families
                 .entry(egui::FontFamily::Proportional)
@@ -233,10 +407,12 @@ fn main() {
                 .entry(egui::FontFamily::Monospace)
                 .or_default()
                 .insert(0, "fz_font".to_owned());
-
             cc.egui_ctx.set_fonts(fonts);
 
-            Ok(Box::new(ClockApp::default()))
+            let mut app = ClockApp::default();
+            app.load_history();
+            app.load_config(); // 加载文字颜色配置
+            Box::new(app)
         }),
     );
 }

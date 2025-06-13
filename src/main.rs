@@ -18,6 +18,7 @@ const BACKGROUND_IMAGE_PATH: &str = "background.png";
 #[derive(Clone, Serialize, Deserialize)]
 struct CountdownTask {
     id: usize,
+    name: String, // 新增任务名
     input: String,
     duration: Duration,
     created_at: DateTime<Local>,
@@ -32,9 +33,10 @@ struct CountdownTask {
 }
 
 impl CountdownTask {
-    fn new(id: usize, input: String, duration: Duration) -> Self {
+    fn new(id: usize, name: String, input: String, duration: Duration) -> Self {
         Self {
             id,
+            name,
             input,
             duration,
             created_at: Local::now(),
@@ -82,6 +84,7 @@ struct ClockApp {
     tasks: Vec<CountdownTask>,
     next_task_id: usize,
     new_task_input: String,
+    new_task_name: String, // 新增任务名输入框内容
     history: Vec<CountdownTask>,
     show_finished_popup: Option<usize>,
 
@@ -102,6 +105,7 @@ impl Default for ClockApp {
             tasks: Vec::new(),
             next_task_id: 0,
             new_task_input: String::new(),
+            new_task_name: String::new(),
             history: Vec::new(),
             show_finished_popup: None,
             background_texture: None,
@@ -225,9 +229,11 @@ impl App for ClockApp {
         CentralPanel::default().show(ctx, |ui| {
             ui.vertical_centered(|ui| {
                 ui.add_space(10.0);
-                ui.heading(RichText::new(Local::now().format("%H:%M:%S").to_string())
-                    .size(48.0)
-                    .color(self.text_color));
+                ui.heading(
+                    RichText::new(Local::now().format("%H:%M:%S").to_string())
+                        .size(48.0)
+                        .color(self.text_color),
+                );
                 ui.add_space(10.0);
             });
 
@@ -251,16 +257,34 @@ impl App for ClockApp {
 
             ui.separator();
 
-            ui.horizontal(|ui| {
+            // 改为垂直布局，避免按钮被挤出窗口
+            ui.group(|ui| {
+                ui.label("任务名:");
+                ui.text_edit_singleline(&mut self.new_task_name);
+                ui.add_space(4.0);
+
                 ui.label("倒计时 (秒或 HH:MM:SS):");
                 ui.text_edit_singleline(&mut self.new_task_input);
+                ui.add_space(4.0);
+
                 if ui.button("添加").clicked() {
                     if let Some(dur) = Self::parse_duration(&self.new_task_input) {
                         if dur.as_secs() > 0 {
                             let id = self.next_task_id;
                             self.next_task_id += 1;
-                            self.tasks.push(CountdownTask::new(id, self.new_task_input.clone(), dur));
+                            let name = if self.new_task_name.trim().is_empty() {
+                                format!("任务#{}", id)
+                            } else {
+                                self.new_task_name.trim().to_string()
+                            };
+                            self.tasks.push(CountdownTask::new(
+                                id,
+                                name,
+                                self.new_task_input.clone(),
+                                dur,
+                            ));
                             self.new_task_input.clear();
+                            self.new_task_name.clear();
                         }
                     }
                 }
@@ -282,10 +306,12 @@ impl App for ClockApp {
 
                         ui.group(|ui| {
                             ui.vertical(|ui| {
+                                ui.label(
+                                    RichText::new(format!("任务名: {}", task.name)).strong(),
+                                );
                                 ui.label(RichText::new(
-                                    format!("开始时间: {}", task.created_at.format("%Y-%m-%d %H:%M:%S"))
-                                ).strong());
-
+                                    format!("开始时间: {}", task.created_at.format("%Y-%m-%d %H:%M:%S")),
+                                ));
                                 ui.label(format!("设定时长: {}", task.input));
 
                                 ui.horizontal(|ui| {
@@ -335,7 +361,10 @@ impl App for ClockApp {
 
                     for task in just_finished_tasks {
                         self.play_alarm_sound();
-                        Self::show_notification("倒计时结束", &format!("开始于 {} 的倒计时已结束", task.created_at.format("%Y-%m-%d %H:%M:%S")));
+                        Self::show_notification(
+                            "倒计时结束",
+                            &format!("任务“{}”开始于 {} 的倒计时已结束", task.name, task.created_at.format("%Y-%m-%d %H:%M:%S")),
+                        );
                         self.history.push(task.clone());
                         self.save_data();
                         self.show_finished_popup = Some(task.id);
@@ -356,7 +385,8 @@ impl App for ClockApp {
                     for task in self.history.iter().rev() {
                         ui.horizontal(|ui| {
                             ui.label(format!(
-                                "开始时间: {}，设定时长: {}",
+                                "任务名: {}，开始时间: {}，设定时长: {}",
+                                task.name,
                                 task.created_at.format("%Y-%m-%d %H:%M:%S"),
                                 task.input
                             ));
@@ -380,11 +410,19 @@ impl App for ClockApp {
                 .resizable(false)
                 .anchor(Align2::CENTER_CENTER, [0.0, 0.0])
                 .show(ctx, |ui| {
-                    let task_time = self.tasks.iter()
+                    let task_time = self
+                        .tasks
+                        .iter()
                         .find(|t| t.id == id)
                         .map(|t| t.created_at.format("%Y-%m-%d %H:%M:%S").to_string())
                         .unwrap_or_else(|| "未知".to_string());
-                    ui.label(format!("开始于 {} 的倒计时已结束！", task_time));
+                    let task_name = self
+                        .tasks
+                        .iter()
+                        .find(|t| t.id == id)
+                        .map(|t| t.name.clone())
+                        .unwrap_or_else(|| "未知任务".to_string());
+                    ui.label(format!("任务“{}”开始于 {} 的倒计时已结束！", task_name, task_time));
                     if ui.button("关闭").clicked() {
                         self.show_finished_popup = None;
                     }
